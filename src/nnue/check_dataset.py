@@ -1,23 +1,15 @@
-import csv
 from collections import Counter
+
+from nnue.dataset import iter_fen_cp_rows
 
 path = "data/raw/positions.csv"
 
 n = 0
 cp = []
 
-with open(path, newline="", encoding="utf-8") as f:
-    r = csv.reader(f)
-    header = next(r, None)  # skip header if present
-    for row in r:
-        if not row or len(row) < 2:
-            continue
-        try:
-            cp_val = int(row[1])
-        except ValueError:
-            continue
-        n += 1
-        cp.append(cp_val)
+for fen, y_cp in iter_fen_cp_rows(path):
+    n += 1
+    cp.append(int(y_cp))
 
 print("rows:", n)
 print("cp min/max:", min(cp), max(cp))

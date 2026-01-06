@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import csv
+import itertools
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 import math
 import torch
 from torch.utils.data import Dataset
@@ -19,59 +20,99 @@ class Sample:
     stm: int
     y: float
 
+
+def iter_fen_cp_rows(csv_path: str, max_rows: int | None = None):
+    """Yield (fen, centipawn) tuples from either 2-column CSVs or alternating-line files.
+
+    Some public datasets ship as a single-column CSV where FENs and centipawn values
+    alternate line by line (with optional ``FEN``/``Evaluation`` headers). Others use a
+    traditional 2-column CSV. This helper normalizes both formats.
+    """
+
+    def _yield_column_rows(rows):
+        count = 0
+        for row in rows:
+            if max_rows is not None and count >= max_rows:
+                break
+
+            if not row or len(row) < 2:
+                continue
+
+            fen = row[0].strip()
+            try:
+                y_cp = float(row[1])
+            except (TypeError, ValueError):
+                continue
+
+            if abs(y_cp) >= 30000:
+                continue
+
+            count += 1
+            yield fen, y_cp
+
+    def _yield_alternating_rows(rows):
+        count = 0
+        pending_fen: str | None = None
+
+        for row in rows:
+            if max_rows is not None and count >= max_rows:
+                break
+
+            if not row:
+                continue
+
+            cell = row[0].strip()
+            if not cell:
+                continue
+
+            lower = cell.lower()
+            if lower in {"fen", "evaluation"}:
+                continue
+
+            if pending_fen is None:
+                pending_fen = cell
+                continue
+
+            try:
+                y_cp = float(cell)
+            except ValueError:
+                # Treat the current line as the next FEN candidate.
+                pending_fen = cell
+                continue
+
+            if abs(y_cp) >= 30000:
+                pending_fen = None
+                continue
+
+            count += 1
+            yield pending_fen, y_cp
+            pending_fen = None
+
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        buffered = []
+        for _ in range(5):
+            try:
+                buffered.append(next(reader))
+            except StopIteration:
+                break
+
+        row_iter = itertools.chain(buffered, reader)
+        has_columns = any(len(r) >= 2 for r in buffered if r)
+
+        yield from _yield_column_rows(row_iter) if has_columns else _yield_alternating_rows(row_iter)
+
 class FenCpDataset(Dataset):
     def __init__(self, csv_path: str, max_rows: int | None = None):
         self.samples: List[Sample] = []
-        with open(csv_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-
-            # Skip header if present
-            first = next(reader, None)
-            if first is not None:
-                # If it looks like a header (second column not numeric), ignore it.
-                try:
-                    float(first[1])
-                    # It was data, not header
-                    row = first
-                    # fall through by processing row below
-                    fen = row[0].strip()
-                    y_cp = float(row[1])
-
-                    pf = extract_features_from_fen(fen)
-                    self.samples.append(Sample(
-                        fw=pf.features_for_white_king(),
-                        fb=pf.features_for_black_king(),
-                        stm=pf.stm,
-                        y=math.tanh(y_cp / 600.0),
-                    ))
-                except Exception:
-                    pass
-
-            for row in reader:
-                if not row or len(row) < 2:
-                    continue
-
-                fen = row[0].strip()
-
-                try:
-                    y_cp = float(row[1])
-                except ValueError:
-                    # skip any malformed rows / headers
-                    continue
-                # Drop mate-clamped values for now (you set these to +/-30000)
-                if abs(y_cp) >= 30000:
-                    continue
-
-                pf = extract_features_from_fen(fen)
-                self.samples.append(Sample(
-                    fw=pf.features_for_white_king(),
-                    fb=pf.features_for_black_king(),
-                    stm=pf.stm,
-                    y=math.tanh(y_cp / 600.0),
-                ))
-
-                if max_rows is not None and len(self.samples) >= max_rows:
-                    break
+        for fen, y_cp in iter_fen_cp_rows(csv_path, max_rows=max_rows):
+            pf = extract_features_from_fen(fen)
+            self.samples.append(Sample(
+                fw=pf.features_for_white_king(),
+                fb=pf.features_for_black_king(),
+                stm=pf.stm,
+                y=math.tanh(y_cp / 600.0),
+            ))
 
     def __len__(self) -> int:
         return len(self.samples)
