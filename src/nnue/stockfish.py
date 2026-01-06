@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
 import chess
 import chess.pgn
 
-# ---- CONFIG ----
+# ---- CONFIG (defaults; override via CLI) ----
 # Point this to your Stockfish .exe
 STOCKFISH_PATH = r"../stockfish-windows-x86-64-avx2.exe"
 
@@ -44,7 +45,7 @@ class StockfishUCI:
     Persistent Stockfish process (much faster than spawning per FEN).
     """
 
-    def __init__(self, exe_path: str):
+    def __init__(self, exe_path: str, mate_cp: int = MATE_CP):
         self.proc = subprocess.Popen(
             [exe_path],
             stdin=subprocess.PIPE,
@@ -54,6 +55,7 @@ class StockfishUCI:
             bufsize=1,
         )
         assert self.proc.stdin and self.proc.stdout
+        self.mate_cp = mate_cp
         self._uci_init()
 
     def _send(self, cmd: str) -> None:
@@ -123,7 +125,7 @@ class StockfishUCI:
                 break
 
         if last_mate is not None:
-            return MATE_CP if last_mate > 0 else -MATE_CP
+            return self.mate_cp if last_mate > 0 else -self.mate_cp
         return last_cp
 
     def close(self) -> None:
@@ -139,14 +141,21 @@ class StockfishUCI:
 
 def iter_pgn_games(pgn_path: Path) -> Iterable[chess.pgn.Game]:
     """
-    Yields games from a .pgn file.
+    Yields games from a .pgn file, or all .pgn files in a directory.
     """
-    with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
-        while True:
-            game = chess.pgn.read_game(f)
-            if game is None:
-                break
-            yield game
+    paths: Sequence[Path]
+    if pgn_path.is_dir():
+        paths = sorted(pgn_path.glob("*.pgn"))
+    else:
+        paths = [pgn_path]
+
+    for path in paths:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            while True:
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    break
+                yield game
 
 
 def iter_sampled_positions_from_game(
@@ -183,57 +192,106 @@ def ensure_out_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def count_existing_rows(csv_path: Path) -> int:
+    """
+    Counts existing rows (excluding header) for append/resume workflows.
+    """
+    if not csv_path.exists():
+        return 0
+
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # skip header if present
+        return sum(1 for _ in reader)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate Stockfish-labeled NNUE positions")
+    parser.add_argument("--stockfish", type=str, default=STOCKFISH_PATH, help="Path to Stockfish executable")
+    parser.add_argument("--pgn", type=Path, default=PGN_PATH, help="PGN file or directory of PGNs")
+    parser.add_argument("--out", type=Path, default=OUT_CSV, help="Output CSV path")
+    parser.add_argument("--depth", type=int, default=DEPTH, help="Search depth")
+    parser.add_argument("--mate-cp", type=int, default=MATE_CP, help="Clamp value for mate scores")
+    parser.add_argument("--max-positions", type=int, default=MAX_POSITIONS, help="Positions to write (per run)")
+    parser.add_argument("--min-ply", type=int, default=MIN_PLY, help="Minimum ply before sampling")
+    parser.add_argument("--max-ply", type=int, default=MAX_PLY, help="Maximum ply to consider")
+    parser.add_argument("--sample-every", type=int, default=SAMPLE_EVERY, help="Sample every N plies")
+    parser.add_argument("--fsync-every", type=int, default=FSYNC_EVERY, help="Flush and fsync frequency")
+    parser.add_argument("--report-every", type=int, default=50, help="Progress print frequency")
+    parser.add_argument("--append", action="store_true", help="Append to existing CSV (resume)")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     # Resolve output location
-    ensure_out_dir(OUT_CSV)
-    out_abs = OUT_CSV.resolve()
+    ensure_out_dir(args.out)
+    out_abs = args.out.resolve()
     print("Writing dataset to:", out_abs)
 
     # Validate Stockfish exists
-    if not os.path.exists(STOCKFISH_PATH):
-        raise FileNotFoundError(f"Stockfish not found: {STOCKFISH_PATH}")
+    if not os.path.exists(args.stockfish):
+        raise FileNotFoundError(f"Stockfish not found: {args.stockfish}")
 
     # Validate PGN exists
-    if not PGN_PATH.exists():
-        raise FileNotFoundError(f"PGN not found: {PGN_PATH.resolve()}")
+    if not args.pgn.exists():
+        raise FileNotFoundError(f"PGN not found: {args.pgn.resolve()}")
 
-    engine = StockfishUCI(STOCKFISH_PATH)
+    existing_rows = count_existing_rows(args.out) if args.append else 0
+    mode = "a" if args.append else "w"
+    write_header = not args.append or existing_rows == 0
+    target_total = existing_rows + args.max_positions
 
-    n_written = 0
+    if args.append and existing_rows:
+        print(f"Append mode: found {existing_rows} existing rows; target total = {target_total}")
+    elif args.append:
+        print("Append mode requested but no existing file; starting fresh.")
+
+    engine = StockfishUCI(args.stockfish, mate_cp=args.mate_cp)
+
+    n_written = existing_rows
     n_seen = 0
 
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["fen", "cp"])
+    try:
+        with open(args.out, mode, newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["fen", "cp"])
 
-        for game in iter_pgn_games(PGN_PATH):
-            for fen in iter_sampled_positions_from_game(game):
-                n_seen += 1
-                cp = engine.eval_cp(fen, depth=DEPTH)
-                writer.writerow([fen, cp])
-                n_written += 1
+            for game in iter_pgn_games(args.pgn):
+                for fen in iter_sampled_positions_from_game(
+                    game,
+                    min_ply=args.min_ply,
+                    max_ply=args.max_ply,
+                    sample_every=args.sample_every,
+                ):
+                    n_seen += 1
+                    cp = engine.eval_cp(fen, depth=args.depth)
+                    writer.writerow([fen, cp])
+                    n_written += 1
 
-                # Print progress occasionally
-                if n_written % 50 == 0:
-                    print(f"written={n_written} last_cp={cp}")
+                    # Print progress occasionally
+                    if n_written % args.report_every == 0:
+                        print(f"written={n_written} last_cp={cp}")
 
-                # Force flush so you always see file growth
-                if n_written % FSYNC_EVERY == 0:
-                    f.flush()
-                    os.fsync(f.fileno())
+                    # Force flush so you always see file growth
+                    if args.fsync_every > 0 and n_written % args.fsync_every == 0:
+                        f.flush()
+                        os.fsync(f.fileno())
 
-                if n_written >= MAX_POSITIONS:
-                    print("Reached MAX_POSITIONS.")
-                    f.flush()
-                    os.fsync(f.fileno())
-                    engine.close()
-                    return
+                    if n_written >= target_total:
+                        print("Reached target count.")
+                        f.flush()
+                        os.fsync(f.fileno())
+                        return
 
-        # Final flush
-        f.flush()
-        os.fsync(f.fileno())
+            # Final flush
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        engine.close()
 
-    engine.close()
     print(f"Done. seen={n_seen} written={n_written}")
 
 
