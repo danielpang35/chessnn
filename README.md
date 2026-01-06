@@ -18,8 +18,13 @@ python src/nnue/stockfish.py [options]
 | `--out PATH` | Output CSV path. Parent directories are created automatically. |
 | `--append` | Resume/appends to an existing CSV. Counts current rows, writes more, and stops at the new target total. |
 | `--max-positions N` | Number of *new* rows to write per invocation (or until combined total is reached when `--append` is set). |
-| `--depth N` | Stockfish search depth used for labeling. |
+| `--target-total N` | Desired total rows in the CSV; handy with `--append` to grow toward a fixed final size. |
+| `--depth N` | Stockfish search depth used for labeling (default search limit). |
+| `--nodes N` | Search until N nodes are visited (mutually exclusive with `--depth`/`--movetime`). |
+| `--movetime MS` | Search for MS milliseconds per position (mutually exclusive with `--depth`/`--nodes`). |
 | `--mate-cp N` | Centipawn clamp for mate scores (mates become ±N). |
+| `--threads N` | `Threads` engine option (parallel search; defaults to detected core count). |
+| `--hash-mb N` | `Hash` engine option in MB. |
 | `--min-ply N` / `--max-ply N` | Only sample positions between these ply bounds. |
 | `--sample-every N` | Sample every N plies within the allowed window. |
 | `--report-every N` | Print progress every N written rows. |
@@ -38,6 +43,12 @@ python src/nnue/stockfish.py [options]
   ```
   The script counts existing rows and stops when `existing + max_positions` is reached.
 
+- **Aim for a fixed total size:** if you already have 50k rows and want to reach 1M, set `--target-total` once and re-run as
+  needed. The script will stop after hitting the total.
+  ```
+  python src/nnue/stockfish.py --append --out data/raw/positions.csv --target-total 1000000
+  ```
+
 - **Sweep a folder of PGNs:**
   ```
   python src/nnue/stockfish.py --pgn /data/pgns --out data/raw/positions.csv --append
@@ -49,3 +60,9 @@ python src/nnue/stockfish.py [options]
   ```
 
 - **Reduce disk sync overhead for big batches:** set `--fsync-every 0` (or a larger number) once the workflow is stable.
+
+- **High-throughput labeling:** swap fixed depth for a per-position time cap and enable more threads:
+  ```
+  python src/nnue/stockfish.py --movetime 75 --threads 8 --hash-mb 512 --report-every 200
+  ```
+  This yields many more positions per hour than a deep fixed depth while still producing usable targets. Increase `--movetime` for stronger labels or decrease for speed.

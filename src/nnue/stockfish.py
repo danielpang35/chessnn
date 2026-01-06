@@ -47,7 +47,7 @@ class StockfishUCI:
     Persistent Stockfish process (much faster than spawning per FEN).
     """
 
-    def __init__(self, exe_path: str, mate_cp: int = MATE_CP):
+    def __init__(self, exe_path: str, mate_cp: int = MATE_CP, threads: int = THREADS, hash_mb: int = HASH_MB):
         self.proc = subprocess.Popen(
             [exe_path],
             stdin=subprocess.PIPE,
@@ -58,7 +58,7 @@ class StockfishUCI:
         )
         assert self.proc.stdin and self.proc.stdout
         self.mate_cp = mate_cp
-        self._uci_init()
+        self._uci_init(threads=threads, hash_mb=hash_mb)
 
     def _send(self, cmd: str) -> None:
         assert self.proc.stdin
@@ -230,20 +230,53 @@ def count_existing_rows(csv_path: Path) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate Stockfish-labeled NNUE positions")
+    parser = argparse.ArgumentParser(
+        description="Generate Stockfish-labeled NNUE positions",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--stockfish", type=str, default=STOCKFISH_PATH, help="Path to Stockfish executable")
     parser.add_argument("--pgn", type=Path, default=PGN_PATH, help="PGN file or directory of PGNs")
     parser.add_argument("--out", type=Path, default=OUT_CSV, help="Output CSV path")
-    parser.add_argument("--depth", type=int, default=DEPTH, help="Search depth")
+    search_group = parser.add_mutually_exclusive_group()
+    search_group.add_argument("--depth", type=int, help="Search depth (default if nothing else set)")
+    search_group.add_argument(
+        "--nodes", type=int, help="Search until this many nodes (faster than deep fixed depths)"
+    )
+    search_group.add_argument(
+        "--movetime",
+        type=int,
+        help="Per-position time budget in milliseconds (e.g., 50-200 for high throughput)",
+    )
     parser.add_argument("--mate-cp", type=int, default=MATE_CP, help="Clamp value for mate scores")
     parser.add_argument("--max-positions", type=int, default=MAX_POSITIONS, help="Positions to write (per run)")
+    parser.add_argument(
+        "--target-total",
+        type=int,
+        help="Desired total rows in the CSV; pairs well with --append to grow toward a fixed size",
+    )
     parser.add_argument("--min-ply", type=int, default=MIN_PLY, help="Minimum ply before sampling")
     parser.add_argument("--max-ply", type=int, default=MAX_PLY, help="Maximum ply to consider")
     parser.add_argument("--sample-every", type=int, default=SAMPLE_EVERY, help="Sample every N plies")
+    parser.add_argument("--threads", type=int, default=THREADS, help="Stockfish Threads option")
+    parser.add_argument("--hash-mb", type=int, default=HASH_MB, help="Stockfish Hash option (MB)")
     parser.add_argument("--fsync-every", type=int, default=FSYNC_EVERY, help="Flush and fsync frequency")
-    parser.add_argument("--report-every", type=int, default=50, help="Progress print frequency")
-    parser.add_argument("--append", action="store_true", help="Append to existing CSV (resume)")
-    return parser.parse_args()
+    parser.add_argument(
+        "--report-every",
+        type=int,
+        default=50,
+        help="Print progress every N written rows",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to an existing CSV, counting current rows and writing until the new target total is reached",
+    )
+    args = parser.parse_args()
+
+    if args.depth is None and args.nodes is None and args.movetime is None:
+        args.depth = DEPTH
+
+    return args
 
 
 def main():
@@ -265,14 +298,24 @@ def main():
     existing_rows = count_existing_rows(args.out) if args.append else 0
     mode = "a" if args.append else "w"
     write_header = not args.append or existing_rows == 0
-    target_total = existing_rows + args.max_positions
+
+    if args.target_total is not None:
+        if args.target_total <= existing_rows:
+            raise ValueError(
+                f"Target total ({args.target_total}) must exceed existing rows ({existing_rows}) when appending."
+            )
+        target_total = args.target_total
+    else:
+        target_total = existing_rows + args.max_positions
 
     if args.append and existing_rows:
         print(f"Append mode: found {existing_rows} existing rows; target total = {target_total}")
     elif args.append:
         print("Append mode requested but no existing file; starting fresh.")
 
-    engine = StockfishUCI(args.stockfish, mate_cp=args.mate_cp)
+    engine = StockfishUCI(
+        args.stockfish, mate_cp=args.mate_cp, threads=args.threads, hash_mb=args.hash_mb
+    )
 
     n_written = existing_rows
     n_seen = 0
@@ -291,7 +334,12 @@ def main():
                     sample_every=args.sample_every,
                 ):
                     n_seen += 1
-                    cp = engine.eval_cp(fen, depth=args.depth)
+                    cp = engine.eval_cp(
+                        fen,
+                        depth=args.depth,
+                        nodes=args.nodes,
+                        movetime=args.movetime,
+                    )
                     writer.writerow([fen, cp])
                     n_written += 1
 
