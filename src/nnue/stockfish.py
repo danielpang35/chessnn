@@ -20,6 +20,8 @@ OUT_CSV = Path("data/raw/positions.csv")
 
 # Evaluation settings
 DEPTH = 15
+THREADS = os.cpu_count() or 1
+HASH_MB = 256
 MATE_CP = 30000
 
 # PGN settings
@@ -68,7 +70,7 @@ class StockfishUCI:
         line = self.proc.stdout.readline()
         return line
 
-    def _uci_init(self) -> None:
+    def _uci_init(self, threads: int, hash_mb: int) -> None:
         self._send("uci")
         # Wait for uciok
         while True:
@@ -78,6 +80,11 @@ class StockfishUCI:
             if "uciok" in line:
                 break
 
+        if threads:
+            self._send(f"setoption name Threads value {threads}")
+        if hash_mb:
+            self._send(f"setoption name Hash value {hash_mb}")
+
         self._send("isready")
         while True:
             line = self._readline()
@@ -86,13 +93,30 @@ class StockfishUCI:
             if "readyok" in line:
                 break
 
-    def eval_cp(self, fen: str, depth: int = DEPTH) -> int:
+    def eval_cp(
+        self,
+        fen: str,
+        depth: Optional[int] = DEPTH,
+        nodes: Optional[int] = None,
+        movetime: Optional[int] = None,
+    ) -> int:
         """
         Returns evaluation in centipawns from side-to-move perspective.
         Mates mapped to +/- MATE_CP.
         """
         self._send(f"position fen {fen}")
-        self._send(f"go depth {depth}")
+
+        go_parts = ["go"]
+        if depth is not None:
+            go_parts.extend(["depth", str(depth)])
+        if nodes is not None:
+            go_parts.extend(["nodes", str(nodes)])
+        if movetime is not None:
+            go_parts.extend(["movetime", str(movetime)])
+        if len(go_parts) == 1:
+            raise ValueError("Specify at least one search limit: depth, nodes, or movetime.")
+
+        self._send(" ".join(go_parts))
 
         last_cp = 0
         last_mate: Optional[int] = None
