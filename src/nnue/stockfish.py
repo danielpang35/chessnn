@@ -206,10 +206,7 @@ def count_existing_rows(csv_path: Path) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate Stockfish-labeled NNUE positions",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = argparse.ArgumentParser(description="Generate Stockfish-labeled NNUE positions")
     parser.add_argument("--stockfish", type=str, default=STOCKFISH_PATH, help="Path to Stockfish executable")
     parser.add_argument("--pgn", type=Path, default=PGN_PATH, help="PGN file or directory of PGNs")
     parser.add_argument("--out", type=Path, default=OUT_CSV, help="Output CSV path")
@@ -220,17 +217,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-ply", type=int, default=MAX_PLY, help="Maximum ply to consider")
     parser.add_argument("--sample-every", type=int, default=SAMPLE_EVERY, help="Sample every N plies")
     parser.add_argument("--fsync-every", type=int, default=FSYNC_EVERY, help="Flush and fsync frequency")
-    parser.add_argument(
-        "--report-every",
-        type=int,
-        default=50,
-        help="Print progress every N written rows",
-    )
-    parser.add_argument(
-        "--append",
-        action="store_true",
-        help="Append to an existing CSV, counting current rows and writing until the new target total is reached",
-    )
+    parser.add_argument("--report-every", type=int, default=50, help="Progress print frequency")
+    parser.add_argument("--append", action="store_true", help="Append to existing CSV (resume)")
     return parser.parse_args()
 
 
