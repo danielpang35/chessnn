@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
 import chess
 import chess.pgn
 
-# ---- CONFIG ----
+# ---- CONFIG (defaults; override via CLI) ----
 # Point this to your Stockfish .exe
 STOCKFISH_PATH = r"../stockfish-windows-x86-64-avx2.exe"
 
@@ -19,6 +20,8 @@ OUT_CSV = Path("data/raw/positions.csv")
 
 # Evaluation settings
 DEPTH = 15
+THREADS = os.cpu_count() or 1
+HASH_MB = 256
 MATE_CP = 30000
 
 # PGN settings
@@ -44,7 +47,7 @@ class StockfishUCI:
     Persistent Stockfish process (much faster than spawning per FEN).
     """
 
-    def __init__(self, exe_path: str):
+    def __init__(self, exe_path: str, mate_cp: int = MATE_CP, threads: int = THREADS, hash_mb: int = HASH_MB):
         self.proc = subprocess.Popen(
             [exe_path],
             stdin=subprocess.PIPE,
@@ -54,7 +57,8 @@ class StockfishUCI:
             bufsize=1,
         )
         assert self.proc.stdin and self.proc.stdout
-        self._uci_init()
+        self.mate_cp = mate_cp
+        self._uci_init(threads=threads, hash_mb=hash_mb)
 
     def _send(self, cmd: str) -> None:
         assert self.proc.stdin
@@ -66,7 +70,7 @@ class StockfishUCI:
         line = self.proc.stdout.readline()
         return line
 
-    def _uci_init(self) -> None:
+    def _uci_init(self, threads: int, hash_mb: int) -> None:
         self._send("uci")
         # Wait for uciok
         while True:
@@ -76,6 +80,11 @@ class StockfishUCI:
             if "uciok" in line:
                 break
 
+        if threads:
+            self._send(f"setoption name Threads value {threads}")
+        if hash_mb:
+            self._send(f"setoption name Hash value {hash_mb}")
+
         self._send("isready")
         while True:
             line = self._readline()
@@ -84,13 +93,30 @@ class StockfishUCI:
             if "readyok" in line:
                 break
 
-    def eval_cp(self, fen: str, depth: int = DEPTH) -> int:
+    def eval_cp(
+        self,
+        fen: str,
+        depth: Optional[int] = DEPTH,
+        nodes: Optional[int] = None,
+        movetime: Optional[int] = None,
+    ) -> int:
         """
         Returns evaluation in centipawns from side-to-move perspective.
         Mates mapped to +/- MATE_CP.
         """
         self._send(f"position fen {fen}")
-        self._send(f"go depth {depth}")
+
+        go_parts = ["go"]
+        if depth is not None:
+            go_parts.extend(["depth", str(depth)])
+        if nodes is not None:
+            go_parts.extend(["nodes", str(nodes)])
+        if movetime is not None:
+            go_parts.extend(["movetime", str(movetime)])
+        if len(go_parts) == 1:
+            raise ValueError("Specify at least one search limit: depth, nodes, or movetime.")
+
+        self._send(" ".join(go_parts))
 
         last_cp = 0
         last_mate: Optional[int] = None
@@ -123,7 +149,7 @@ class StockfishUCI:
                 break
 
         if last_mate is not None:
-            return MATE_CP if last_mate > 0 else -MATE_CP
+            return self.mate_cp if last_mate > 0 else -self.mate_cp
         return last_cp
 
     def close(self) -> None:
@@ -139,14 +165,21 @@ class StockfishUCI:
 
 def iter_pgn_games(pgn_path: Path) -> Iterable[chess.pgn.Game]:
     """
-    Yields games from a .pgn file.
+    Yields games from a .pgn file, or all .pgn files in a directory.
     """
-    with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
-        while True:
-            game = chess.pgn.read_game(f)
-            if game is None:
-                break
-            yield game
+    paths: Sequence[Path]
+    if pgn_path.is_dir():
+        paths = sorted(pgn_path.glob("*.pgn"))
+    else:
+        paths = [pgn_path]
+
+    for path in paths:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            while True:
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    break
+                yield game
 
 
 def iter_sampled_positions_from_game(
@@ -183,57 +216,154 @@ def ensure_out_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def count_existing_rows(csv_path: Path) -> int:
+    """
+    Counts existing rows (excluding header) for append/resume workflows.
+    """
+    if not csv_path.exists():
+        return 0
+
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # skip header if present
+        return sum(1 for _ in reader)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate Stockfish-labeled NNUE positions",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--stockfish", type=str, default=STOCKFISH_PATH, help="Path to Stockfish executable")
+    parser.add_argument("--pgn", type=Path, default=PGN_PATH, help="PGN file or directory of PGNs")
+    parser.add_argument("--out", type=Path, default=OUT_CSV, help="Output CSV path")
+    search_group = parser.add_mutually_exclusive_group()
+    search_group.add_argument("--depth", type=int, help="Search depth (default if nothing else set)")
+    search_group.add_argument(
+        "--nodes", type=int, help="Search until this many nodes (faster than deep fixed depths)"
+    )
+    search_group.add_argument(
+        "--movetime",
+        type=int,
+        help="Per-position time budget in milliseconds (e.g., 50-200 for high throughput)",
+    )
+    parser.add_argument("--mate-cp", type=int, default=MATE_CP, help="Clamp value for mate scores")
+    parser.add_argument("--max-positions", type=int, default=MAX_POSITIONS, help="Positions to write (per run)")
+    parser.add_argument(
+        "--target-total",
+        type=int,
+        help="Desired total rows in the CSV; pairs well with --append to grow toward a fixed size",
+    )
+    parser.add_argument("--min-ply", type=int, default=MIN_PLY, help="Minimum ply before sampling")
+    parser.add_argument("--max-ply", type=int, default=MAX_PLY, help="Maximum ply to consider")
+    parser.add_argument("--sample-every", type=int, default=SAMPLE_EVERY, help="Sample every N plies")
+    parser.add_argument("--threads", type=int, default=THREADS, help="Stockfish Threads option")
+    parser.add_argument("--hash-mb", type=int, default=HASH_MB, help="Stockfish Hash option (MB)")
+    parser.add_argument("--fsync-every", type=int, default=FSYNC_EVERY, help="Flush and fsync frequency")
+    parser.add_argument(
+        "--report-every",
+        type=int,
+        default=50,
+        help="Print progress every N written rows",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to an existing CSV, counting current rows and writing until the new target total is reached",
+    )
+    args = parser.parse_args()
+
+    if args.depth is None and args.nodes is None and args.movetime is None:
+        args.depth = DEPTH
+
+    return args
+
+
 def main():
+    args = parse_args()
+
     # Resolve output location
-    ensure_out_dir(OUT_CSV)
-    out_abs = OUT_CSV.resolve()
+    ensure_out_dir(args.out)
+    out_abs = args.out.resolve()
     print("Writing dataset to:", out_abs)
 
     # Validate Stockfish exists
-    if not os.path.exists(STOCKFISH_PATH):
-        raise FileNotFoundError(f"Stockfish not found: {STOCKFISH_PATH}")
+    if not os.path.exists(args.stockfish):
+        raise FileNotFoundError(f"Stockfish not found: {args.stockfish}")
 
     # Validate PGN exists
-    if not PGN_PATH.exists():
-        raise FileNotFoundError(f"PGN not found: {PGN_PATH.resolve()}")
+    if not args.pgn.exists():
+        raise FileNotFoundError(f"PGN not found: {args.pgn.resolve()}")
 
-    engine = StockfishUCI(STOCKFISH_PATH)
+    existing_rows = count_existing_rows(args.out) if args.append else 0
+    mode = "a" if args.append else "w"
+    write_header = not args.append or existing_rows == 0
 
-    n_written = 0
+    if args.target_total is not None:
+        if args.target_total <= existing_rows:
+            raise ValueError(
+                f"Target total ({args.target_total}) must exceed existing rows ({existing_rows}) when appending."
+            )
+        target_total = args.target_total
+    else:
+        target_total = existing_rows + args.max_positions
+
+    if args.append and existing_rows:
+        print(f"Append mode: found {existing_rows} existing rows; target total = {target_total}")
+    elif args.append:
+        print("Append mode requested but no existing file; starting fresh.")
+
+    engine = StockfishUCI(
+        args.stockfish, mate_cp=args.mate_cp, threads=args.threads, hash_mb=args.hash_mb
+    )
+
+    n_written = existing_rows
     n_seen = 0
 
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["fen", "cp"])
+    try:
+        with open(args.out, mode, newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["fen", "cp"])
 
-        for game in iter_pgn_games(PGN_PATH):
-            for fen in iter_sampled_positions_from_game(game):
-                n_seen += 1
-                cp = engine.eval_cp(fen, depth=DEPTH)
-                writer.writerow([fen, cp])
-                n_written += 1
+            for game in iter_pgn_games(args.pgn):
+                for fen in iter_sampled_positions_from_game(
+                    game,
+                    min_ply=args.min_ply,
+                    max_ply=args.max_ply,
+                    sample_every=args.sample_every,
+                ):
+                    n_seen += 1
+                    cp = engine.eval_cp(
+                        fen,
+                        depth=args.depth,
+                        nodes=args.nodes,
+                        movetime=args.movetime,
+                    )
+                    writer.writerow([fen, cp])
+                    n_written += 1
 
-                # Print progress occasionally
-                if n_written % 50 == 0:
-                    print(f"written={n_written} last_cp={cp}")
+                    # Print progress occasionally
+                    if n_written % args.report_every == 0:
+                        print(f"written={n_written} last_cp={cp}")
 
-                # Force flush so you always see file growth
-                if n_written % FSYNC_EVERY == 0:
-                    f.flush()
-                    os.fsync(f.fileno())
+                    # Force flush so you always see file growth
+                    if args.fsync_every > 0 and n_written % args.fsync_every == 0:
+                        f.flush()
+                        os.fsync(f.fileno())
 
-                if n_written >= MAX_POSITIONS:
-                    print("Reached MAX_POSITIONS.")
-                    f.flush()
-                    os.fsync(f.fileno())
-                    engine.close()
-                    return
+                    if n_written >= target_total:
+                        print("Reached target count.")
+                        f.flush()
+                        os.fsync(f.fileno())
+                        return
 
-        # Final flush
-        f.flush()
-        os.fsync(f.fileno())
+            # Final flush
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        engine.close()
 
-    engine.close()
     print(f"Done. seen={n_seen} written={n_written}")
 
 
